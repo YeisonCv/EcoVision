@@ -1,0 +1,29 @@
+# Secrets and local environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Version control and Python caches
+.git/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
+*.py[cod]
+
+# Local state, logs, temporary files, and test artifacts
+instance/
+*.log
+*.tmp
+*.temp
+*~
+.coverage*
+htmlcov/
+.cache/
+
+# Model artifacts not used for inference
+modelo/best_model.keras
+modelo/training_curves.png
