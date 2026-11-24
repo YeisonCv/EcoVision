@@ -17,6 +17,10 @@ Se utiliza `modelo/waste_classifier.keras` tal como fue proporcionado, con entra
 
 Las clases se cargan exclusivamente desde `modelo/classes.txt`: battery, biological, brown-glass, cardboard, clothes, green-glass, metal, paper, plastic, shoes, trash y white-glass. `MODEL_DIR`, `MODEL_FILENAME` y `CLASSES_FILENAME` permiten configurar las rutas sin cambiar código. No se entrena ni descarga nada al iniciar.
 
+## Entrenamiento y evaluación
+
+El modelo se entrenó con el dataset Garbage Classification de Mostafa Abla, dividido de forma estratificada en entrenamiento, validación y prueba. El entrenamiento tuvo etapas de Transfer Learning y Fine-tuning con MobileNetV2 e ImageNet. En la evaluación final sobre las 2.328 imágenes de prueba obtuvo **95,27 % de accuracy**, **95,28 % de F1 ponderado** y **93,58 % de F1 macro**. Las métricas completas, configuración de entrenamiento y análisis por categoría están en [Entrenamiento y evaluación del modelo](docs/model-training-evaluation.md).
+
 ## Requisitos
 
 - Docker Desktop con Docker Compose, recomendado para Windows/macOS/Linux.
