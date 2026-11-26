@@ -1,0 +1,22 @@
+# Isolated end-to-end stack. Use only with docker-compose.test.yml and its
+# dedicated project name; PostgreSQL data is ephemeral in the test compose.
+services:
+  app-e2e:
+    image: ecovision:portable
+    build: .
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://ecovision_test:ecovision_test_only@postgres-test:5432/ecovision_test
+      ECOVISION_E2E: "1"
+      MODEL_DIR: /app/modelo
+      MAX_IMAGE_MB: "10"
+      RATE_LIMIT_STORAGE_URI: memory://
+      TRUSTED_PROXY_HOPS: "0"
+    ports:
+      - "127.0.0.1:${E2E_PORT:-5002}:5000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m,mode=1777
+    restart: "no"
