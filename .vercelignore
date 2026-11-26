@@ -1,0 +1,33 @@
+# Local secrets and database artifacts
+.env*
+secrets/
+*.crt
+*.pem
+data/
+instance/
+
+# Development, tests, reports, and training-only artifacts
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+**/.pytest_cache/
+tests/
+docs/
+skills/
+verify_model.py
+modelo/best_model.keras
+modelo/training_curves.png
+requirements-dev.txt
+requirements-docker.txt
+pytest.ini
+
+# Container-only files and local image export
+Dockerfile
+docker-compose*.yml
+ecovision*.tar
+.dockerignore
+.coverage*
+htmlcov/

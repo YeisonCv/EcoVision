@@ -3,20 +3,40 @@ import runpy
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import make_url
+from sqlalchemy.pool import NullPool
 
 from app import create_app, load_environment, migrate, resolve_database_url
 from database import db
 
 
 VALID_TEST_URL = "postgresql+psycopg://test:test@127.0.0.1:1/ecovision_test"
+TEST_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIICzjCCAbagAwIBAgIJAKXKgmY4/1ljMA0GCSqGSIb3DQEBCwUAMBwxGjAYBgNV
+BAMTEUVjb1Zpc2lvbiBUZXN0IENBMB4XDTI2MTEyNTA2MDk0NFoXDTI3MTEyNjA2
+MDk0NFowHDEaMBgGA1UEAxMRRWNvVmlzaW9uIFRlc3QgQ0EwggEiMA0GCSqGSIb3
+DQEBAQUAA4IBDwAwggEKAoIBAQC/xacHc1AlTyH1EjO8gUpuG/FrrmZGe8fHcpPM
+f7zaj8KfGSYx8QXKf0kwqnpeyfc6PftulYouutRE4LAaMkO9baPUpv9LyoTO7gsz
+Si2TG0gPFD0rOdwut6a6SnruRXaypJl6YMHqSgkXDs2HL3IJVzIsLl7J67J05UVv
+fOoMpYkOVjo9cAKYsj+rBVfmN5L1wZDI0++ShwdqAmEhPRYepbYs9m7opzRycO5o
+KbKqcwSSfMrqbIaC6AopkKMDDJcNxH71ENmGBB7Xa7LZWxQ+U9RpSRKJL6XZ4a0F
+T9WEKvjWstkBWTaS2HJKzIMcKv5eOahLM92uqOOKVbIfBAotAgMBAAGjEzARMA8G
+A1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAFgYLjX/YHQlGDTLdE2p
+gKavYJNt1AYcv5ZbN5TOf+rEbXvnNgDMPMmgAdCeYgxv5E05KvxfDOKxLw8CA1Xd
+ditkB3lcmRacPIOJX+dUunK2ZUxai1xm/COSqgzKPqvAEKqkLvqqBhr3FJhB+DhK
+CpH3IwB0bBLe72RxWFr97mnjiQCoyHJolR92VVM07sq40lYNZdVMH9GUDwIb68Lh
+C4YW5s132NY1DzTZjGV5Ys3NMIe/fEr7SJa2JAglwyYJtpFeI4UyDp1pLOrntlF5
+mbvXz9oWg5SoL8Waz7Yz7dSvmtek//OmoIb2ou1APuWq4+tvgApWgIHSz0Hu++r1
+KCA=
+-----END CERTIFICATE-----"""
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
@@ -47,19 +67,165 @@ def test_psycopg3_postgresql_url_is_accepted():
 
 
 def test_remote_postgresql_requires_ca_and_verify_full(tmp_path, monkeypatch):
+    import app
+
+    app._ca_certificate_files.clear()
+    monkeypatch.setattr(app, "_ca_temp_directory", lambda: str(tmp_path))
     monkeypatch.delenv("SUPABASE_CA_FILE", raising=False)
+    monkeypatch.delenv("SUPABASE_CA_CERT", raising=False)
     remote_url = "postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres?sslmode=require"
-    with pytest.raises(RuntimeError, match="SUPABASE_CA_FILE") as error:
+    with pytest.raises(RuntimeError, match="SUPABASE_CA_FILE o SUPABASE_CA_CERT") as error:
         resolve_database_url(remote_url)
     assert "secret" not in str(error.value)
 
-    ca_file = tmp_path / "supabase-ca.crt"
-    ca_file.write_text("test-only certificate placeholder", encoding="ascii")
-    resolved = resolve_database_url(remote_url, str(ca_file))
+    resolved = resolve_database_url(remote_url, ca_cert=TEST_CA_PEM)
     resolved_url = make_url(resolved)
     assert resolved_url.query["sslmode"] == "verify-full"
-    assert resolved_url.query["sslrootcert"] == str(ca_file.resolve())
+    assert Path(resolved_url.query["sslrootcert"]).is_file()
     assert "secret" not in str(error.value)
+
+
+def test_valid_ca_file_is_used_when_pem_is_not_configured(tmp_path, monkeypatch):
+    ca_file = tmp_path / "supabase-ca.crt"
+    ca_file.write_text(TEST_CA_PEM, encoding="ascii")
+    monkeypatch.setenv("SUPABASE_CA_FILE", str(ca_file))
+    monkeypatch.delenv("SUPABASE_CA_CERT", raising=False)
+
+    resolved = make_url(resolve_database_url(
+        "postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres",
+    ))
+    assert resolved.query["sslmode"] == "verify-full"
+    assert resolved.query["sslrootcert"] == str(ca_file.resolve())
+
+
+def test_valid_pem_takes_priority_over_ca_file(tmp_path, monkeypatch):
+    import app
+
+    app._ca_certificate_files.clear()
+    ca_file = tmp_path / "supabase-ca.crt"
+    ca_file.write_text(TEST_CA_PEM, encoding="ascii")
+    monkeypatch.setattr(app, "_ca_temp_directory", lambda: str(tmp_path))
+    monkeypatch.setenv("SUPABASE_CA_FILE", str(ca_file))
+    monkeypatch.setenv("SUPABASE_CA_CERT", TEST_CA_PEM)
+
+    resolved = make_url(resolve_database_url(
+        "postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres?sslmode=disable&sslrootcert=wrong",
+    ))
+    pem_path = Path(resolved.query["sslrootcert"])
+    assert pem_path != ca_file.resolve()
+    assert pem_path.read_text(encoding="ascii").strip() == TEST_CA_PEM
+    assert resolved.query["sslmode"] == "verify-full"
+
+
+def test_invalid_pem_does_not_fall_back_to_valid_ca_file(tmp_path, monkeypatch):
+    ca_file = tmp_path / "supabase-ca.crt"
+    ca_file.write_text(TEST_CA_PEM, encoding="ascii")
+    monkeypatch.setenv("SUPABASE_CA_FILE", str(ca_file))
+    monkeypatch.setenv("SUPABASE_CA_CERT", "invalid-secret-pem")
+
+    with pytest.raises(RuntimeError, match="SUPABASE_CA_CERT") as error:
+        resolve_database_url("postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres")
+    assert "invalid-secret-pem" not in str(error.value)
+    assert "secret" not in str(error.value)
+
+
+def test_ca_cert_environment_is_supported_without_ca_file(tmp_path, monkeypatch):
+    import app
+
+    app._ca_certificate_files.clear()
+    monkeypatch.delenv("SUPABASE_CA_FILE", raising=False)
+    monkeypatch.setenv("SUPABASE_CA_CERT", TEST_CA_PEM.replace("\n", "\\n"))
+    monkeypatch.setattr(app, "_ca_temp_directory", lambda: str(tmp_path))
+
+    resolved = make_url(resolve_database_url(
+        "postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres",
+    ))
+    certificate_path = Path(resolved.query["sslrootcert"])
+    assert certificate_path.parent == tmp_path
+    assert certificate_path.read_text(encoding="ascii").strip() == TEST_CA_PEM
+    assert resolved.query["sslmode"] == "verify-full"
+    assert resolved.drivername == "postgresql+psycopg"
+
+    from sqlalchemy import create_engine
+    engine = create_engine(resolved)
+    try:
+        _args, connect_kwargs = engine.dialect.create_connect_args(engine.url)
+        assert connect_kwargs["sslmode"] == "verify-full"
+        assert connect_kwargs["sslrootcert"] == str(certificate_path)
+    finally:
+        engine.dispose()
+
+
+def test_invalid_ca_file_falls_back_to_valid_pem(tmp_path, monkeypatch):
+    import app
+
+    app._ca_certificate_files.clear()
+    invalid_file = tmp_path / "missing-or-invalid.crt"
+    invalid_file.write_text("not a certificate", encoding="ascii")
+    monkeypatch.setenv("SUPABASE_CA_FILE", str(invalid_file))
+    monkeypatch.setenv("SUPABASE_CA_CERT", TEST_CA_PEM)
+    monkeypatch.setattr(app, "_ca_temp_directory", lambda: str(tmp_path))
+
+    resolved = make_url(resolve_database_url(
+        "postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres",
+    ))
+    assert Path(resolved.query["sslrootcert"]).name.startswith("ecovision-supabase-ca-")
+
+
+@pytest.mark.parametrize("certificate", [
+    "", "not PEM", "-----BEGIN CERTIFICATE-----\\ninvalid\\n-----END CERTIFICATE-----",
+    "-----BEGIN CERTIFICATE-----\\nAQID\\n-----END CERTIFICATE-----",
+])
+def test_empty_or_invalid_pem_fails_safely(certificate, monkeypatch, caplog):
+    monkeypatch.delenv("SUPABASE_CA_FILE", raising=False)
+    monkeypatch.setenv("SUPABASE_CA_CERT", certificate)
+    with pytest.raises(RuntimeError, match="SUPABASE_CA_CERT") as error:
+        resolve_database_url("postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres")
+    if certificate:
+        assert certificate not in str(error.value)
+        assert certificate not in caplog.text
+    assert "secret" not in str(error.value)
+
+
+def test_nonexistent_ca_file_without_pem_fails_clearly(monkeypatch):
+    monkeypatch.setenv("SUPABASE_CA_FILE", "Z:/path/that/does/not/exist/supabase-ca.crt")
+    monkeypatch.delenv("SUPABASE_CA_CERT", raising=False)
+    with pytest.raises(RuntimeError, match="SUPABASE_CA_FILE o SUPABASE_CA_CERT"):
+        resolve_database_url("postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres")
+
+
+def test_temp_ca_file_is_private_and_reused_under_concurrent_initialization(tmp_path, monkeypatch):
+    import stat
+    import app
+
+    app._ca_certificate_files.clear()
+    monkeypatch.delenv("SUPABASE_CA_FILE", raising=False)
+    monkeypatch.delenv("SUPABASE_CA_CERT", raising=False)
+    monkeypatch.setattr(app, "_ca_temp_directory", lambda: str(tmp_path))
+    url = "postgresql+psycopg://user:secret@db.example.supabase.co:5432/postgres"
+
+    with patch("app.os.chmod", wraps=os.chmod) as chmod, ThreadPoolExecutor(max_workers=8) as executor:
+        paths = list(executor.map(lambda _: make_url(resolve_database_url(url, ca_cert=TEST_CA_PEM)).query["sslrootcert"], range(16)))
+
+    assert len(set(paths)) == 1
+    chmod.assert_called_once_with(paths[0], 0o600)
+    ca_path = Path(paths[0])
+    assert ca_path.parent == tmp_path
+    if os.name == "posix":
+        assert stat.S_IMODE(ca_path.stat().st_mode) == 0o600
+    else:
+        # Windows does not expose POSIX mode bits as its ACL; mkstemp still
+        # creates the file under the current user's private temp directory.
+        assert str(ca_path).startswith(str(tmp_path))
+    assert ca_path.read_text(encoding="ascii").strip() == TEST_CA_PEM
+    assert len(list(tmp_path.glob("ecovision-supabase-ca-*.crt"))) == 1
+
+
+def test_ca_temp_directory_is_tmp_on_linux(monkeypatch):
+    import app
+
+    monkeypatch.setattr(app.os, "name", "posix")
+    assert app._ca_temp_directory() == "/tmp"
 
 
 def test_create_app_does_not_create_tables_automatically():
@@ -157,6 +323,37 @@ def test_gunicorn_wsgi_import_does_not_create_tables_or_connect():
     assert result.stdout.strip().endswith("ddl_calls=0")
 
 
+@pytest.mark.parametrize("port", [6543, 5432])
+def test_serverless_engine_passes_tls_and_transaction_pooler_options_to_psycopg(port, tmp_path, monkeypatch):
+    import app
+
+    monkeypatch.setattr(app, "_ca_temp_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(app, "_ca_certificate_files", {})
+    monkeypatch.setenv("SUPABASE_CA_CERT", TEST_CA_PEM)
+    monkeypatch.setenv("DATABASE_URL",
+                       f"postgresql+psycopg://test:test@pooler.example.invalid:{port}/test?connect_timeout=5")
+    test_app = create_app({"TESTING": True})
+    with test_app.app_context():
+        engine = db.engine
+        assert isinstance(engine.pool, NullPool)
+        assert engine.hide_parameters is True
+        connect = Mock(side_effect=RuntimeError("DBAPI intercepted"))
+        monkeypatch.setattr(engine.dialect.dbapi, "connect", connect)
+        with pytest.raises(RuntimeError, match="DBAPI intercepted"):
+            engine.connect()
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["host"] == "pooler.example.invalid"
+    assert kwargs["port"] == port
+    assert kwargs["sslmode"] == "verify-full"
+    assert Path(kwargs["sslrootcert"]).parent == tmp_path
+    assert kwargs["connect_timeout"] == "5"
+    if port == 6543:
+        assert "prepare_threshold" in kwargs and kwargs["prepare_threshold"] is None
+    else:
+        assert "prepare_threshold" not in kwargs
+
+
 def test_import_fails_clearly_when_database_url_is_missing():
     script = "import app"
     environment = os.environ.copy()
@@ -171,6 +368,7 @@ def test_import_fails_clearly_when_database_url_is_missing():
 
 
 def test_environment_loader_reads_file_and_keeps_exported_value(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
     dotenv_path = tmp_path / ".env.test"
     dotenv_path.write_text("ECOVISION_DOTENV_TEST_VALUE=from-file\n", encoding="utf-8")
     monkeypatch.delenv("ECOVISION_DOTENV_TEST_VALUE", raising=False)

@@ -8,6 +8,7 @@ from PIL import Image
 # A syntactically valid, unreachable PostgreSQL URL. Tests replace persistence and
 # never establish a connection to this address or to the user's Supabase project.
 os.environ["DATABASE_URL"] = "postgresql+psycopg://test:test@127.0.0.1:1/ecovision_test"
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 from app import create_app
 from database import db
@@ -100,6 +101,9 @@ class FakeSession:
         self.records.append(record)
 
     def commit(self):
+        pass
+
+    def flush(self):
         pass
 
     def rollback(self):

@@ -46,7 +46,7 @@ def validate_upload(filename: str, stream) -> None:
         raise UnsupportedImageExtensionError("Formato no permitido. Usa JPG, JPEG o PNG.")
 
 
-def prepare_image(stream, max_bytes: int = 10 * 1024 * 1024) -> np.ndarray:
+def prepare_image(stream, max_bytes: int = 4 * 1024 * 1024) -> np.ndarray:
     data = stream.read(max_bytes + 1)
     if not data:
         raise ImageValidationError("El archivo está vacío.")
@@ -65,7 +65,7 @@ def prepare_image(stream, max_bytes: int = 10 * 1024 * 1024) -> np.ndarray:
             return np.asarray(image, dtype=np.float32)[None, ...]
     except ImageValidationError:
         raise
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError) as exc:
         raise ImageValidationError("El archivo no contiene una imagen válida o está dañado.") from exc
 
 

@@ -226,3 +226,10 @@ __marimo__/
 
 # skills
 skills/
+
+# secrets
+secrets/
+.env.*
+!.env.example
+*.crt
+*.pem

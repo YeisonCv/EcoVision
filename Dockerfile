@@ -4,8 +4,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system --gid 10001 ecovision && useradd --system --uid 10001 --gid 10001 --home-dir /home/ecovision --create-home --shell /usr/sbin/nologin ecovision
 ENV HOME=/home/ecovision KERAS_HOME=/tmp/keras TMPDIR=/tmp
-COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+COPY requirements-docker.txt ./
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements-docker.txt
 COPY app.py ./
 COPY backend ./backend
 COPY database ./database

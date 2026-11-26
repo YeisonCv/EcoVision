@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import ssl
+import tempfile
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +18,7 @@ from werkzeug.exceptions import HTTPException
 from sqlalchemy import func, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+from sqlalchemy.pool import NullPool
 from werkzeug.utils import secure_filename
 
 from backend.prediction import (ImageValidationError, ModelUnavailableError,
@@ -23,8 +28,11 @@ from database import db
 from database.models import Prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+MIB = 1024 * 1024
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
 migrate = Migrate()
-limiter = Limiter(key_func=get_remote_address, default_limits=["120 per minute"])
+_ca_certificate_lock = threading.Lock()
+_ca_certificate_files = {}
 
 
 def load_environment(dotenv_path=PROJECT_ROOT / ".env"):
@@ -32,10 +40,95 @@ def load_environment(dotenv_path=PROJECT_ROOT / ".env"):
     return load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
-load_environment()
+if not os.getenv("VERCEL"):
+    load_environment()
 
 
-def resolve_database_url(configured_url=None, ca_file=None):
+def _validated_ca_pem(certificate):
+    """Normalize and cryptographically parse PEM X.509 CA certificate data."""
+    if isinstance(certificate, bytes):
+        try:
+            certificate = certificate.decode("ascii")
+        except UnicodeDecodeError:
+            raise ValueError from None
+    if not isinstance(certificate, str) or not certificate.strip():
+        raise ValueError
+
+    pem = certificate.replace("\\n", "\n").strip()
+    if not re.search(r"-----BEGIN CERTIFICATE-----\s*[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----", pem):
+        raise ValueError
+    try:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        context.load_verify_locations(cadata=pem)
+    except (ssl.SSLError, ValueError):
+        raise ValueError from None
+    if not context.get_ca_certs(binary_form=True):
+        raise ValueError
+    return pem
+
+
+def _ca_temp_directory():
+    """Use Vercel's writable filesystem; use the user's temp directory on Windows."""
+    return tempfile.gettempdir() if os.name == "nt" else "/tmp"
+
+
+def _ca_file_from_pem(pem):
+    """Write validated PEM once per process to a private, collision-safe temp file."""
+    digest = hashlib.sha256(pem.encode("ascii")).hexdigest()
+    with _ca_certificate_lock:
+        cached_path = _ca_certificate_files.get(digest)
+        if cached_path:
+            try:
+                if Path(cached_path).read_text(encoding="ascii").strip() == pem:
+                    return cached_path
+            except OSError:
+                pass
+
+        fd, path = tempfile.mkstemp(prefix="ecovision-supabase-ca-", suffix=".crt", dir=_ca_temp_directory())
+        try:
+            os.chmod(path, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii", newline="\n") as certificate_file:
+                certificate_file.write(pem)
+                certificate_file.write("\n")
+                certificate_file.flush()
+                os.fsync(certificate_file.fileno())
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise RuntimeError("No fue posible preparar el certificado CA temporal; revisa SUPABASE_CA_CERT.") from None
+
+        _ca_certificate_files[digest] = path
+        return path
+
+
+def _resolve_ca_file(ca_file=None, ca_cert=None):
+    """Prefer explicitly configured PEM, with a CA file as secondary option."""
+    configured_cert = ca_cert if ca_cert is not None else os.getenv("SUPABASE_CA_CERT")
+    if configured_cert is not None:
+        try:
+            return _ca_file_from_pem(_validated_ca_pem(configured_cert))
+        except ValueError:
+            raise RuntimeError("SUPABASE_CA_CERT debe contener un certificado CA X.509 válido en formato PEM.") from None
+
+    configured_file = ca_file if ca_file is not None else os.getenv("SUPABASE_CA_FILE")
+    if configured_file:
+        try:
+            file_path = Path(configured_file).expanduser()
+            _validated_ca_pem(file_path.read_bytes())
+            return str(file_path.resolve())
+        except (OSError, ValueError, TypeError):
+            # A missing or invalid secondary file is reported by the caller.
+            pass
+    return None
+
+
+def resolve_database_url(configured_url=None, ca_file=None, ca_cert=None):
     """Require psycopg 3 and enforce certificate validation for remote PostgreSQL."""
     if configured_url is None:
         configured_url = os.getenv("DATABASE_URL")
@@ -57,9 +150,9 @@ def resolve_database_url(configured_url=None, ca_file=None):
                              and parsed_url.database == "ecovision_test"
                              and parsed_url.username == "ecovision_test")
     if parsed_url.host not in local_hosts and not isolated_compose_test:
-        ca_file = ca_file or os.getenv("SUPABASE_CA_FILE")
-        if not ca_file or not Path(ca_file).is_file():
-            raise RuntimeError("La conexión PostgreSQL remota requiere SUPABASE_CA_FILE con el certificado CA oficial.")
+        ca_file = _resolve_ca_file(ca_file, ca_cert)
+        if not ca_file:
+            raise RuntimeError("La conexión PostgreSQL remota requiere un certificado CA válido en SUPABASE_CA_FILE o SUPABASE_CA_CERT.")
         query = dict(parsed_url.query)
         query.update(sslmode="verify-full", sslrootcert=str(Path(ca_file).resolve()))
         parsed_url = parsed_url.set(query=query)
@@ -68,23 +161,27 @@ def resolve_database_url(configured_url=None, ca_file=None):
 
 def create_app(test_config=None):
     app = Flask(__name__, template_folder="visualizacion/templates", static_folder="visualizacion/static")
-    max_image_mb = int(os.getenv("MAX_IMAGE_MB", "10"))
-    configured_url = (test_config or {}).get("SQLALCHEMY_DATABASE_URI")
-    app.config.update(MAX_IMAGE_MB=max(1, min(25, max_image_mb)), SQLALCHEMY_TRACK_MODIFICATIONS=False,
-                      SQLALCHEMY_DATABASE_URI=resolve_database_url(configured_url),
-                      SQLALCHEMY_ENGINE_OPTIONS={"pool_pre_ping": True, "pool_recycle": 1800,
-                                                 "pool_size": 5, "max_overflow": 0})
-    app.config["MAX_CONTENT_LENGTH"] = app.config["MAX_IMAGE_MB"] * 1024 * 1024
+    app.config.update(DEBUG=False, MAX_IMAGE_MB=os.getenv("MAX_IMAGE_MB", "4"),
+                      SQLALCHEMY_TRACK_MODIFICATIONS=False)
     if test_config:
         app.config.update(test_config)
-        # Test configuration cannot bypass the PostgreSQL-only runtime policy.
-        app.config["SQLALCHEMY_DATABASE_URI"] = resolve_database_url(app.config["SQLALCHEMY_DATABASE_URI"])
+    app.config["MAX_IMAGE_MB"] = max(1, min(4, int(app.config["MAX_IMAGE_MB"])))
+    if app.config["MAX_CONTENT_LENGTH"] is None:
+        app.config["MAX_CONTENT_LENGTH"] = app.config["MAX_IMAGE_MB"] * MIB + MULTIPART_OVERHEAD_BYTES
+    app.config["SQLALCHEMY_DATABASE_URI"] = resolve_database_url(app.config.get("SQLALCHEMY_DATABASE_URI"))
+    database_url = make_url(app.config["SQLALCHEMY_DATABASE_URI"])
+    engine_options = {"poolclass": NullPool, "hide_parameters": True}
+    if database_url.port == 6543:
+        engine_options["connect_args"] = {"prepare_threshold": None}
+    app.config.setdefault("SQLALCHEMY_ENGINE_OPTIONS", engine_options)
     local_origins = "http://localhost:5000,http://127.0.0.1:5000,http://localhost:3000,http://127.0.0.1:3000"
-    configured_origins = app.config.get("CORS_ALLOWED_ORIGINS", os.getenv("CORS_ALLOWED_ORIGINS", local_origins))
+    default_origins = "" if os.getenv("VERCEL") else local_origins
+    configured_origins = app.config.get("CORS_ALLOWED_ORIGINS", os.getenv("CORS_ALLOWED_ORIGINS", default_origins))
     app.config["CORS_ALLOWED_ORIGINS"] = {
         origin.strip().rstrip("/") for origin in configured_origins.split(",") if origin.strip()
     } if isinstance(configured_origins, str) else set(configured_origins)
     app.config.setdefault("RATELIMIT_STORAGE_URI", os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"))
+    app.config.setdefault("PREDICTION_RATE_LIMIT", os.getenv("PREDICTION_RATE_LIMIT", "10 per minute"))
     app.config.setdefault("RATELIMIT_ENABLED", True)
     configured_proxy_hops = app.config.get("TRUSTED_PROXY_HOPS", os.getenv("TRUSTED_PROXY_HOPS", "0"))
     try:
@@ -99,14 +196,15 @@ def create_app(test_config=None):
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxy_hops)
     db.init_app(app)
     migrate.init_app(app, db)
+    limiter = Limiter(key_func=get_remote_address, default_limits=["120 per minute"])
     limiter.init_app(app)
+    # Disabled limit decorators still refer to the extension by weak reference.
+    app.extensions["prediction_limiter"] = limiter
     model_path, classes_path = model_paths()
     app.extensions["classifier"] = None
     app.extensions["classes"] = []
     app.extensions["model_error"] = None
-    # Gunicorn is configured with several request threads. Serialize calls into
-    # the single in-process model to bound peak memory and avoid concurrent
-    # TensorFlow predict() calls sharing the same model instance.
+    # Reuse the model in this process and bound peak memory during decoding and inference.
     app.extensions["inference_lock"] = threading.Lock()
     try:
         app.extensions["classes"] = load_classes(classes_path)
@@ -122,7 +220,7 @@ def create_app(test_config=None):
 
     @app.get("/clasificador")
     def classifier_page():
-        return render_template("classifier.html")
+        return render_template("classifier.html", max_image_mb=app.config["MAX_IMAGE_MB"])
 
     @app.get("/historial")
     def history_page():
@@ -147,11 +245,16 @@ def create_app(test_config=None):
                         "database": database_status}), status
 
     @app.post("/api/predict")
-    @limiter.limit("5 per minute")
+    @limiter.limit(lambda: app.config["PREDICTION_RATE_LIMIT"])
     def predict():
         uploaded = request.files.get("image")
         if uploaded is None or not uploaded.filename:
             return jsonify(error="Debes seleccionar una imagen."), 400
+        max_file_bytes = app.config["MAX_IMAGE_MB"] * MIB
+        file_bytes = uploaded.stream.seek(0, os.SEEK_END)
+        uploaded.stream.seek(0)
+        if file_bytes > max_file_bytes:
+            return jsonify(error=f"El archivo supera el límite de {app.config['MAX_IMAGE_MB']} MiB por imagen."), 413
         try:
             validate_upload(uploaded.filename, uploaded.stream)
         except UnsupportedImageExtensionError as exc:
@@ -163,22 +266,24 @@ def create_app(test_config=None):
             return jsonify(error="El modelo no está disponible. Revisa la configuración del servidor."), 503
         try:
             with app.extensions["inference_lock"]:
-                batch = prepare_image(uploaded.stream, app.config["MAX_CONTENT_LENGTH"])
+                batch = prepare_image(uploaded.stream, max_file_bytes)
                 result = classify(model, app.extensions["classes"], batch)
         except ImageValidationError as exc:
             return jsonify(error=str(exc)), 400
-        except ModelUnavailableError:
-            app.logger.exception("Prediction failed")
+        except ModelUnavailableError as exc:
+            app.logger.error("Prediction failed (%s)", type(exc.__cause__ or exc).__name__)
             return jsonify(error="No fue posible analizar la imagen."), 500
         try:
             record = Prediction(filename=secure_filename(uploaded.filename)[:255] or "imagen", category=result["category"], confidence=result["confidence"])
             db.session.add(record)
+            db.session.flush()
+            prediction = record.as_dict()
             db.session.commit()
-        except SQLAlchemyError:
+        except SQLAlchemyError as exc:
             db.session.rollback()
-            app.logger.exception("Could not persist prediction")
+            app.logger.error("Could not persist prediction (%s)", type(exc).__name__)
             return jsonify(error="La imagen se analizó, pero no se pudo guardar el resultado."), 503
-        return jsonify({**result, "prediction": record.as_dict(), "message": "Resultado del modelo; la confianza es una probabilidad, no una garantía."}), 201
+        return jsonify({**result, "prediction": prediction, "message": "Resultado del modelo; la confianza es una probabilidad, no una garantía."}), 201
 
     @app.get("/api/predictions")
     @limiter.limit("30 per minute")
@@ -220,9 +325,9 @@ def create_app(test_config=None):
             return jsonify(error="date_from no puede ser posterior a date_to."), 400
         try:
             result = query.order_by(Prediction.created_at.desc(), Prediction.id.desc()).paginate(page=page, per_page=per_page, error_out=False)
-        except SQLAlchemyError:
+        except SQLAlchemyError as exc:
             db.session.rollback()
-            app.logger.exception("Could not query prediction history")
+            app.logger.error("Could not query prediction history (%s)", type(exc).__name__)
             return jsonify(error="No fue posible consultar el historial."), 503
         return jsonify(items=[item.as_dict() for item in result.items], page=page, per_page=per_page, total=result.total, pages=result.pages)
 
@@ -231,9 +336,9 @@ def create_app(test_config=None):
     def prediction_detail(prediction_id):
         try:
             record = db.session.get(Prediction, prediction_id)
-        except SQLAlchemyError:
+        except SQLAlchemyError as exc:
             db.session.rollback()
-            app.logger.exception("Could not query prediction detail")
+            app.logger.error("Could not query prediction detail (%s)", type(exc).__name__)
             return jsonify(error="No fue posible consultar la predicción."), 503
         if record is None:
             return jsonify(error="No se encontró la predicción solicitada."), 404
@@ -253,9 +358,9 @@ def create_app(test_config=None):
             daily = (db.session.query(func.date(Prediction.created_at), func.count(Prediction.id))
                      .filter(Prediction.created_at >= cutoff).group_by(func.date(Prediction.created_at))
                      .order_by(func.date(Prediction.created_at)).all())
-        except SQLAlchemyError:
+        except SQLAlchemyError as exc:
             db.session.rollback()
-            app.logger.exception("Could not query prediction statistics")
+            app.logger.error("Could not query prediction statistics (%s)", type(exc).__name__)
             return jsonify(error="No fue posible consultar las estadísticas."), 503
         return jsonify(total=total, most_common=rows[0][0] if rows else None,
                        average_confidence=float(average) if average is not None else None,
@@ -265,13 +370,24 @@ def create_app(test_config=None):
 
     @app.errorhandler(413)
     def too_large(_):
-        return jsonify(error=f"El archivo supera el tamaño máximo de {app.config['MAX_IMAGE_MB']} MB."), 413
+        return jsonify(error="La solicitud completa supera el límite de tamaño. Envía una sola imagen."), 413
 
     @app.after_request
-    def apply_api_cors(response):
+    def apply_response_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' blob:; style-src 'self' 'unsafe-inline'; "
+            "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        )
+        if not request.path.startswith("/api/"):
+            return response
+        response.headers["Cache-Control"] = "no-store"
         origin = request.headers.get("Origin")
+        if app.config["CORS_ALLOWED_ORIGINS"]:
+            response.vary.add("Origin")
         if origin:
-            response.headers.add("Vary", "Origin")
             if origin.rstrip("/") in app.config["CORS_ALLOWED_ORIGINS"]:
                 response.headers["Access-Control-Allow-Origin"] = origin
                 response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -282,12 +398,17 @@ def create_app(test_config=None):
     @app.errorhandler(HTTPException)
     def handle_http_exception(error):
         if request.path.startswith("/api/"):
-            return jsonify(error="La solicitud no pudo completarse."), error.code
+            message = ("Se alcanzó el límite de solicitudes. Inténtalo de nuevo en un momento."
+                       if error.code == 429 else "La solicitud no pudo completarse.")
+            response = error.get_response()
+            response.set_data(app.json.dumps({"error": message}))
+            response.mimetype = "application/json"
+            return response
         return error
 
     @app.errorhandler(Exception)
     def handle_unexpected_error(error):
-        app.logger.exception("Unhandled application error")
+        app.logger.error("Unhandled application error (%s)", type(error).__name__)
         if request.path.startswith("/api/"):
             return jsonify(error="Ocurrió un error interno. Inténtalo de nuevo."), 500
         return jsonify(error="Ocurrió un error interno."), 500

@@ -67,7 +67,7 @@ Las métricas siguientes corresponden a la ejecución final sobre las **2.328 im
 
 ## Matriz de confusión y reporte CSV
 
-No se encontraron `confusion_matrix.png` ni `classification_report.csv` en el repositorio, así que no se incluye una imagen ni un enlace a un archivo inexistente. Para incorporarlos cuando estén disponibles, cópialos a `docs/figures/confusion_matrix.png` y `docs/figures/classification_report.csv`, respectivamente. La matriz podrá insertarse aquí con la ruta relativa `figures/confusion_matrix.png`.
+La matriz de confusion y el reporte CSV estan disponibles en [confusion_matrix.png](confusion_matrix.png) y [classification_report.csv](classification_report.csv), respectivamente.
 
 ## Análisis de resultados
 

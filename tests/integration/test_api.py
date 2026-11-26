@@ -1,5 +1,8 @@
 import io
+from unittest.mock import Mock
+
 from flask import request
+from PIL import Image
 from sqlalchemy.exc import SQLAlchemyError
 
 from app import create_app
@@ -82,6 +85,63 @@ def test_upload_size_and_decoded_dimensions_are_bounded(client, app, image_file,
     assert response.status_code == 400
 
 
+def test_file_and_request_size_limits_are_distinct(client, app, image_file):
+    limit = 4 * 1024 * 1024
+    assert app.config["MAX_IMAGE_MB"] == 4
+    assert limit < app.config["MAX_CONTENT_LENGTH"] < 4_500_000
+
+    jpeg = image_file.read().ljust(limit, b"\0")
+    assert client.post("/api/predict", data={"image": (io.BytesIO(jpeg), "limit.jpg")}).status_code == 201
+    oversized = client.post("/api/predict", data={"image": (io.BytesIO(jpeg + b"x"), "large.jpg")})
+    assert oversized.status_code == 413
+    assert "4 MiB por imagen" in oversized.json["error"]
+    oversized_request = client.post("/api/predict", data={
+        "image": (io.BytesIO(jpeg), "limit.jpg"),
+        "extra": "x" * 65536,
+    })
+    assert oversized_request.status_code == 413
+    assert "solicitud completa" in oversized_request.json["error"]
+
+
+def test_corrupt_png_and_disguised_image_are_rejected(client):
+    image = io.BytesIO()
+    Image.new("RGB", (40, 30)).save(image, format="PNG")
+    corrupt_png = image.getvalue()[:-10]
+    assert client.post("/api/predict", data={"image": (io.BytesIO(corrupt_png), "corrupt.png")}).status_code == 400
+    image.seek(0)
+    Image.new("RGB", (40, 30)).save(image, format="GIF")
+    image.seek(0)
+    assert client.post("/api/predict", data={"image": (image, "disguised.jpg")}).status_code == 400
+
+
+def test_classifier_and_assets_have_security_headers(client):
+    for path in ("/", "/clasificador", "/historial", "/estadisticas"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert "default-src 'self'" in response.headers["Content-Security-Policy"]
+        assert "img-src 'self' blob:" in response.headers["Content-Security-Policy"]
+        assert "camera=(self)" in response.headers["Permissions-Policy"]
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert b"<script>" not in response.data
+    assert b'data-max-image-mib="4"' in client.get("/clasificador").data
+    for path in ("/static/js/app.js", "/static/css/app.css"):
+        assert client.get(path).status_code == 200
+    assert client.get("/api/predictions").headers["Cache-Control"] == "no-store"
+
+
+def test_prediction_rolls_back_on_commit_error_and_removes_session(client, app, image_file, monkeypatch, caplog):
+    session = app.extensions["test_session"]
+    monkeypatch.setattr(session, "commit", Mock(side_effect=SQLAlchemyError("sensitive connection detail")))
+    monkeypatch.setattr(session, "rollback", Mock())
+    monkeypatch.setattr(session, "remove", Mock())
+    response = client.post("/api/predict", data={"image": (image_file, "test.jpg")})
+    assert response.status_code == 503
+    assert "sensitive connection detail" not in response.get_data(as_text=True)
+    assert "sensitive connection detail" not in caplog.text
+    session.rollback.assert_called_once()
+    session.remove.assert_called_once()
+
+
 def test_inference_failure_returns_safe_error_and_does_not_persist(client, app, image_file):
     class BrokenModel:
         def predict(self, *_args, **_kwargs):
@@ -131,10 +191,24 @@ def test_prediction_rate_limit_uses_remote_address_without_trusting_forwarded_he
                            "RATELIMIT_STORAGE_URI": "memory://",
                            "SQLALCHEMY_DATABASE_URI": "postgresql+psycopg://test:test@127.0.0.1:1/ecovision_test"})
     client = rate_app.test_client()
-    statuses = [client.post("/api/predict", headers={"X-Forwarded-For": f"198.51.100.{n}"}).status_code
-                for n in range(1, 7)]
-    assert statuses[:5] == [400] * 5
-    assert statuses[5] == 429
+    for n in range(1, 12):
+        address = f"198.51.100.{n}"
+        response = client.post("/api/predict", headers={
+            "X-Forwarded-For": address, "X-Real-IP": address,
+            "X-Vercel-Forwarded-For": address, "Forwarded": f"for={address}",
+        }, environ_overrides={"REMOTE_ADDR": "203.0.113.5"})
+        assert response.status_code == (400 if n <= 10 else 429)
+    assert response.is_json
+    assert client.post("/api/predict", environ_overrides={"REMOTE_ADDR": "203.0.113.6"}).status_code == 400
+
+
+def test_prediction_rate_limit_and_storage_can_be_set_from_environment(monkeypatch):
+    monkeypatch.setenv("PREDICTION_RATE_LIMIT", "2 per minute")
+    monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", "memory://ecovision-test")
+    rate_app = create_app({"TESTING": True})
+    assert rate_app.config["RATELIMIT_STORAGE_URI"] == "memory://ecovision-test"
+    client = rate_app.test_client()
+    assert [client.post("/api/predict").status_code for _ in range(3)] == [400, 400, 429]
 
 
 def test_proxy_headers_are_used_only_when_trusted_hops_are_explicit():
