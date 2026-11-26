@@ -9,7 +9,9 @@ from PIL import Image, ImageFile, UnidentifiedImageError
 
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 ALLOWED_FORMATS = {"JPEG", "PNG"}
-MAX_IMAGE_PIXELS = 40_000_000
+# Bound decoded RGB memory (roughly 60 MiB at the limit, excluding Pillow/model
+# buffers) as well as compressed upload size, which is bounded by the caller.
+MAX_IMAGE_PIXELS = 20_000_000
 
 
 class ImageValidationError(ValueError):

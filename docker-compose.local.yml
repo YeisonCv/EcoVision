@@ -1,0 +1,6 @@
+# Local-only port publication. Combine with docker-compose.yml:
+# docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+services:
+  app:
+    ports:
+      - "127.0.0.1:${PORT:-5000}:5000"

@@ -1,0 +1,19 @@
+# Isolated PostgreSQL for integration tests only. No named volumes are used;
+# PGDATA lives in container tmpfs and disappears when this container is removed.
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ecovision_test
+      POSTGRES_USER: ecovision_test
+      POSTGRES_PASSWORD: ecovision_test_only
+    ports:
+      - "127.0.0.1:${TEST_POSTGRES_PORT:-55432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ecovision_test -d ecovision_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: "no"
