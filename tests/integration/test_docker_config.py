@@ -1,8 +1,20 @@
 from pathlib import Path
+from fnmatch import fnmatchcase
 import re
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def expand_braces(pattern):
+    group = re.search(r"\{([^{}]+)\}", pattern)
+    if group is None:
+        return {pattern}
+    return {
+        expanded
+        for option in group[1].split(",")
+        for expanded in expand_braces(pattern[:group.start()] + option + pattern[group.end():])
+    }
 
 
 def test_dockerfile_copies_the_complete_migrations_directory():
@@ -49,8 +61,11 @@ def test_vercel_bundle_excludes_non_runtime_and_local_files_but_includes_app_ass
     assert config["regions"] == ["pdx1"]
     assert function["maxDuration"] == 60
     assert "memory" not in function
-    included = set(function["includeFiles"].strip("{}").split(","))
-    excluded = set(function["excludeFiles"].strip("{}").split(","))
+    for field in ("includeFiles", "excludeFiles"):
+        assert isinstance(function[field], str)
+        assert 0 < len(function[field]) <= 256, field
+    included = expand_braces(function["includeFiles"])
+    excluded = expand_braces(function["excludeFiles"])
     assert {
         "backend/**", "database/**", "migrations/**",
         "visualizacion/templates/**", "visualizacion/static/**",
@@ -58,10 +73,23 @@ def test_vercel_bundle_excludes_non_runtime_and_local_files_but_includes_app_ass
     } <= included
     assert {
         "tests/**", "docs/**", "data/**", "instance/**", "**/secrets/**",
+        "**/__pycache__/**", "**/.pytest_cache/**", "**/.env*",
         "modelo/best_model.keras", "modelo/training_curves.png", "ecovision*.tar",
-        ".env*", "**/.env*", "**/*.crt", "**/*.pem", "**/*.pyc", ".venv/**",
+        "**/*.crt", "**/*.pem", "**/*.pyc", ".venv/**", "venv/**",
+        "verify_model.py", "Dockerfile", "docker*.yml",
+        "requirements-dev.txt", "requirements-docker.txt", "pytest.ini",
     } <= excluded
-    assert not any("migrations" in pattern for pattern in excluded)
+    required_paths = (
+        "app.py", "requirements.txt", "backend/prediction.py", "database/models.py",
+        "migrations/env.py", "visualizacion/templates/classifier.html",
+        "visualizacion/static/js/app.js", "visualizacion/static/css/app.css",
+        "modelo/waste_classifier.keras", "modelo/classes.txt",
+    )
+    for path in required_paths:
+        assert (PROJECT_ROOT / path).is_file()
+        assert not any(fnmatchcase(path, pattern) or (
+            pattern.startswith("**/") and fnmatchcase(path, pattern[3:])
+        ) for pattern in excluded), path
     assert (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.12"
     assert "tensorflow-cpu==2.20.0" in (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
 

@@ -6,7 +6,7 @@
     "app.py": {
       "maxDuration": 60,
       "includeFiles": "{backend/**,database/**,migrations/**,visualizacion/templates/**,visualizacion/static/**,modelo/waste_classifier.keras,modelo/classes.txt}",
-      "excludeFiles": "{tests/**,docs/**,data/**,instance/**,**/secrets/**,**/__pycache__/**,**/*.pyc,.pytest_cache/**,.venv/**,venv/**,modelo/best_model.keras,modelo/training_curves.png,verify_model.py,ecovision*.tar,Dockerfile,docker-compose*.yml,requirements-dev.txt,requirements-docker.txt,pytest.ini,.env*,**/.env*,*.crt,**/*.crt,*.pem,**/*.pem}"
+      "excludeFiles": "{{tests,docs,data,instance,.venv,venv}/**,**/{secrets,__pycache__,.pytest_cache}/**,**/{.env*,*.crt,*.pem,*.pyc},modelo/{best_model.keras,training_curves.png},verify_model.py,ecovision*.tar,Dockerfile,docker*.yml,requirements-{dev,docker}.txt,pytest.ini}"
     }
   }
 }
